@@ -8,10 +8,20 @@ use App\Http\Requests\Guest\RegisterRequest;
 use App\Jobs\SendVerificationCode;
 use App\Models\User;
 use App\Models\Verification;
+use Illuminate\Http\Request;
+use Illuminate\Routing\Controllers\HasMiddleware;
+use Illuminate\Routing\Controllers\Middleware;
+use Illuminate\Support\Facades\Auth;
 use Illuminate\Support\Facades\Hash;
 
-class Authentication extends Controller
+class Authentication extends Controller implements HasMiddleware
 {
+    public static function middleware(): array
+    {
+        return [
+            new Middleware('auth:sanctum', except: ['registerStep1']),
+        ];
+    }
     // Step 1: Register the user
     public function registerStep1(RegisterRequest $request)
     {
@@ -20,29 +30,47 @@ class Authentication extends Controller
 
         // Create a new user in the database
         $user = User::create($data);
+        $user->refresh(); // Refresh the user object to get the new ID
 
         // Store the verification code in the database
         $this->storeCode($user->id, $code);
 
         // Create a token for the user after successful verification
-        $token = $user->createToken($user->email);
 
         // Dispatch a job to send the verification code via email
         SendVerificationCode::dispatch($user->email, $code);
 
         // Return a response with instructions
         return response()->json([
-            'message' => 'Check your inbox for the verification code.',
             'user_id' => $user->id,
-            'token' => $token->plainTextToken
+            'step' => $user->step,
+            'message' => 'Verification code sent successfully',
+            'token' => $user->createToken('authToken')->plainTextToken
         ]);
+    }
+    // resend the code to validate the email
+    public function resendCode()
+    {
+        $user = Auth::user(); // Ensure only the authenticated user can request a resend.
+
+        if (!$user) {
+            return response()->json(['success' => false, 'message' => 'Unauthorized'], 401);
+        }
+
+        if ($user->step !== 1) {
+            return response()->json(['success' => false, 'message' => 'You cannot resend the verification code at this step'], 400);
+        }
+
+        $code = $this->generateCode();
+        $this->storeCode($user->id, $code);
+        SendVerificationCode::dispatch($user->email, $code);
+        return response()->json(['success' => true, 'message' => 'Verification code resent successfully'], 200);
     }
 
     // Step 2: Verify the user's email using the code
     public function registerStep2(CheckCodeRequest $request, User $user)
     {
         $user->load('verification'); // Load associated verification data
-
         // Check if the provided verification code matches the stored hashed code
         if (Hash::check($request->code, $user->verification->hashed_code)) {
             // Update the user's step to 2 (email verified)
@@ -52,17 +80,24 @@ class Authentication extends Controller
             $user->verification->delete();
 
             // Return the token as a response
-            return response()->json(['success' => true], 200);
+            return response()->json(['success' => true, 'message' => 'Email verified successfully','step' => $user->step], 200);
         }
 
         // Return an error response if the code is invalid
-        return response()->json(['success' => false, 'message' => 'Invalid verification code'], 400);
-    }
+        return response()->json([
+            'success' => false,
+            'errors' => [
 
+                "code" => [
+                    "The code does not match."
+                ]
+            ]
+        ], 400);
+    }
     // Store the verification code in the database
     protected function storeCode(int $user_id, int $code)
     {
-        Verification::create([
+        Verification::updateOrCreate([
             'user_id' => $user_id, // Store the user's ID
             'hashed_code' => Hash::make($code), // Hash and store the verification code
         ]);
