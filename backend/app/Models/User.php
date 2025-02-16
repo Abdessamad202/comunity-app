@@ -26,6 +26,10 @@ class User extends Authenticatable
     public function verification(){
         return $this->hasOne(Verification::class);
     }
+    public function profile(){
+        return $this->hasOne(Profile::class);
+    }
+
     /**
      * The attributes that should be hidden for serialization.
      *

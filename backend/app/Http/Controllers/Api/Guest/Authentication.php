@@ -3,9 +3,12 @@
 namespace App\Http\Controllers\Api\Guest;
 
 use App\Http\Controllers\Controller;
+use App\Http\Requests\Guest\LoginRequest;
 use App\Http\Requests\Guest\CheckCodeRequest;
 use App\Http\Requests\Guest\RegisterRequest;
+use App\Http\Requests\Guest\ProfileRegistrationRequest;
 use App\Jobs\SendVerificationCode;
+use App\Models\Profile;
 use App\Models\User;
 use App\Models\Verification;
 use Illuminate\Http\Request;
@@ -19,7 +22,7 @@ class Authentication extends Controller implements HasMiddleware
     public static function middleware(): array
     {
         return [
-            new Middleware('auth:sanctum', except: ['registerStep1']),
+            new Middleware('auth:sanctum', except: ['registerStep1', 'login']),
         ];
     }
     // Step 1: Register the user
@@ -49,14 +52,11 @@ class Authentication extends Controller implements HasMiddleware
         ]);
     }
     // resend the code to validate the email
-    public function resendCode()
+    public function resendCode(User $user)
     {
-        $user = Auth::user(); // Ensure only the authenticated user can request a resend.
-
-        if (!$user) {
-            return response()->json(['success' => false, 'message' => 'Unauthorized'], 401);
+        if ($user->id !== Auth::id()) {
+            return response()->json(['success' => false, 'message' => 'You cannot resend the verification code at this step'], 400);
         }
-
         if ($user->step !== 1) {
             return response()->json(['success' => false, 'message' => 'You cannot resend the verification code at this step'], 400);
         }
@@ -70,6 +70,9 @@ class Authentication extends Controller implements HasMiddleware
     // Step 2: Verify the user's email using the code
     public function registerStep2(CheckCodeRequest $request, User $user)
     {
+        if ($user->id !== Auth::id()) {
+            return response()->json(['success' => false, 'message' => 'You cannot verify the email at this step'], 400);
+        }
         $user->load('verification'); // Load associated verification data
         // Check if the provided verification code matches the stored hashed code
         if (Hash::check($request->code, $user->verification->hashed_code)) {
@@ -80,7 +83,7 @@ class Authentication extends Controller implements HasMiddleware
             $user->verification->delete();
 
             // Return the token as a response
-            return response()->json(['success' => true, 'message' => 'Email verified successfully','step' => $user->step], 200);
+            return response()->json(['success' => true, 'message' => 'Email verified successfully', 'step' => $user->step], 200);
         }
 
         // Return an error response if the code is invalid
@@ -94,19 +97,82 @@ class Authentication extends Controller implements HasMiddleware
             ]
         ], 400);
     }
+    public function registerStep3(ProfileRegistrationRequest $request, User $user)
+    {
+        if ($user->id !== Auth::id()) {
+            return response()->json(['success' => false, 'message' => 'You cannot create the profile at this step'], 400);
+        }
+
+        Profile::create(array_merge($request->validated(), ['user_id' => $user->id]));
+
+        $user->update(['step' => 3]);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Profile Data created successfully',
+            'profile_id' => $user->profile->id
+        ], 201);
+    }
+    public function login(LoginRequest $request)
+    {
+        if (Auth::attempt($request->validated())) {
+            // Authentication passed, get the authenticated user with their profile
+            $user = Auth::user()->load('profile');
+
+            // Check if the user has completed registration (step 3)
+            $token = $user->createToken('authToken')->plainTextToken;
+            if ($user->step == 3) {
+
+                return response()->json([
+                    'success' => true,
+                    'message' => 'Login successful',
+                    'token' => $token,
+                    'profile_id' => $user->profile?->id, // Prevents error if profile is null
+                ], 200);
+            }
+
+            // User has not completed registration
+            return response()->json([
+                'success' => false,
+                'message' => 'You need to complete the registration first',
+                'user_id' => $user->id,
+                'token' => $token,
+                'step' => $user->step
+            ]); // Changed to 403 Forbidden
+        }
+
+        // Authentication failed (invalid credentials)
+        return response()->json([
+            'success' => false,
+            'errors' => [
+                "email" => ["The provided credentials are incorrect."]
+            ]
+        ], 401);
+    }
+
+    public function logout(Request $request)
+    {
+        $request->user()->currentAccessToken()->delete();  // Log the user out using Sanctum
+        return response()->json([
+            'success' => true,
+            'message' => 'Logged out successfully'
+        ], 200);
+    }
+
+
     // Store the verification code in the database
     protected function storeCode(int $user_id, int $code)
     {
-        Verification::updateOrCreate([
-            'user_id' => $user_id, // Store the user's ID
-            'hashed_code' => Hash::make($code), // Hash and store the verification code
-        ]);
+        Verification::updateOrCreate(
+            ['user_id' => $user_id],
+            ['hashed_code' => Hash::make($code)]
+        );
     }
 
     // Generate a random verification code
     protected function generateCode()
     {
-        $length = config('auth.verification_code_length', 6); // Get the code length from the config file
-        return random_int(pow(10, $length - 1), pow(10, $length) - 1); // Generate a random number with the specified length
+        $length = config('auth.verification_code_length', 6);
+        return random_int(pow(10, $length - 1), pow(10, $length) - 1);
     }
 }
